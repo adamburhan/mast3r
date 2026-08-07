@@ -98,6 +98,8 @@ def main():
     p.add_argument('--lr2', type=float, default=0.014)   # paper 5.1 (repo default is 0.01)
     p.add_argument('--niter2', type=int, default=300)
     p.add_argument('--matching_conf_thr', type=float, default=5.0)
+    p.add_argument('--kinematic_mode', default='hclust-ward',
+                   help="'hclust-ward' (repo default) or 'mst' (paper-era)")
     p.add_argument('--device', default='cuda')
     args = p.parse_args()
 
@@ -130,7 +132,7 @@ def main():
         filelist, pairs, str(cache), model,
         lr1=args.lr1, niter1=args.niter1, lr2=args.lr2, niter2=args.niter2,
         matching_conf_thr=args.matching_conf_thr, shared_intrinsics=True,
-        device=args.device)
+        kinematic_mode=args.kinematic_mode, device=args.device)
 
     # ---- save outputs for later depth-stratified evaluation ----------------
     cam2w = scene.get_im_poses().cpu().numpy()
