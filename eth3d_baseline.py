@@ -100,6 +100,8 @@ def main():
     p.add_argument('--matching_conf_thr', type=float, default=5.0)
     p.add_argument('--kinematic_mode', default='hclust-ward',
                    help="'hclust-ward' (repo default) or 'mst' (paper-era)")
+    p.add_argument('--canonical_mode', default='avg-angle',
+                   help="'avg-angle' (baseline) or 'bimodal-<tau>' e.g. 'bimodal-0.15'")
     p.add_argument('--seed', type=int, default=0,
                    help='seeds the FPS keyframe draw in retrieval (graph.py uses '
                         'unseeded np.random.choice) and torch, for reproducible graphs')
@@ -138,7 +140,8 @@ def main():
         filelist, pairs, str(cache), model,
         lr1=args.lr1, niter1=args.niter1, lr2=args.lr2, niter2=args.niter2,
         matching_conf_thr=args.matching_conf_thr, shared_intrinsics=True,
-        kinematic_mode=args.kinematic_mode, device=args.device)
+        kinematic_mode=args.kinematic_mode, canonical_mode=args.canonical_mode,
+        device=args.device)
 
     # ---- save outputs for later depth-stratified evaluation ----------------
     cam2w = scene.get_im_poses().cpu().numpy()

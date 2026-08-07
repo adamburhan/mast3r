@@ -117,7 +117,7 @@ def convert_dust3r_pairs_naming(imgs, pairs_in):
 
 
 def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc_conf='desc_conf',
-                            kinematic_mode='hclust-ward', device='cuda', dtype=torch.float32, shared_intrinsics=False, **kw):
+                            kinematic_mode='hclust-ward', device='cuda', dtype=torch.float32, shared_intrinsics=False, canonical_mode='avg-angle', **kw):
     """ Sparse alignment with MASt3R
         imgs: list of image paths
         cache_path: path where to dump temporary files (str)
@@ -136,7 +136,7 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
 
     # extract canonical pointmaps
     tmp_pairs, pairwise_scores, canonical_views, canonical_paths, preds_21 = \
-        prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode='avg-angle', device=device)
+        prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode=canonical_mode, device=device)
 
     # smartly combine all useful data
     imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21 = \
@@ -852,10 +852,81 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
     return imsizes, principal_points, focals, core_depth, img_anchors, corres, corres2d, subsamp_preds_21
 
 
+def _split_depth_modes(z, conf, conf_min=3.0, min_samples=8, min_cluster=3,
+                       min_wfrac=0.2, kappa=2.5, align_iters=3, eps=1e-8):
+    """Per-pixel two-mode split of the per-pair depth samples at the largest
+    confidence-feasible gap in (per-edge scale-aligned) log depth.
+    z: (E,H,W) raw depths, conf: (E,H,W) raw confidences.
+    Returns (z_dom, z_alt, m_dom, sep), all (H,W); z_* are raw-scale mode means
+    (equal where no supported split), sep is the log-depth mode separation
+    (0 where unsupported) to be gated with sep > tau by the caller."""
+    E = len(z)
+    L = z.clamp(min=eps).log()
+    Wt = torch.where(conf > conf_min, conf, torch.zeros_like(conf))
+    valid = Wt > 0
+    n_conf = valid.sum(0)
+
+    # per-edge global log-scale alignment (used for detection only)
+    offs = torch.zeros(E, device=z.device, dtype=L.dtype)
+    for _ in range(align_iters):
+        La = L - offs[:, None, None]
+        ref = (Wt * La).sum(0) / Wt.sum(0).clamp(min=eps)
+        for e in range(E):
+            m = valid[e] & (n_conf >= 2)
+            if m.any():
+                offs[e] += (La[e][m] - ref[m]).median()
+        offs -= offs.mean()
+    La = L - offs[:, None, None]
+
+    big = torch.where(valid, La, torch.full_like(La, torch.inf))
+    vals, idx = big.sort(dim=0)
+    w_s = torch.gather(Wt, 0, idx)
+    z_s = torch.gather(z, 0, idx)
+    v0 = torch.where(w_s > 0, vals, torch.zeros_like(vals))
+
+    cw, cwz = w_s.cumsum(0), (w_s * z_s).cumsum(0)
+    cv, cv2 = (w_s * v0).cumsum(0), (w_s * v0 * v0).cumsum(0)
+    tw = cw[-1].clamp(min=eps)
+
+    # candidate split after sorted index i: both sides need samples and mass
+    gaps = vals[1:] - vals[:-1]
+    pos = torch.arange(1, E, device=z.device)[:, None, None]
+    ok = (w_s[1:] > 0) & (w_s[:-1] > 0) \
+        & (pos >= min_cluster) & ((n_conf[None] - pos) >= min_cluster)
+    mass_lo = cw[:-1] / tw
+    ok &= torch.minimum(mass_lo, 1. - mass_lo) >= min_wfrac
+    gaps = torch.where(ok, gaps, torch.full_like(gaps, -torch.inf))
+    best_gap, s = gaps.max(0)
+
+    g = s[None]
+    cw_l = cw.gather(0, g)[0].clamp(min=eps)
+    cw_r = (tw - cw_l).clamp(min=eps)
+    z_lo = cwz.gather(0, g)[0] / cw_l
+    z_hi = (cwz[-1] - cwz.gather(0, g)[0]) / cw_r
+    mean_l = cv.gather(0, g)[0] / cw_l
+    mean_r = (cv[-1] - cv.gather(0, g)[0]) / cw_r
+    var_l = (cv2.gather(0, g)[0] / cw_l - mean_l ** 2).clamp(min=0)
+    var_r = ((cv2[-1] - cv2.gather(0, g)[0]) / cw_r - mean_r ** 2).clamp(min=0)
+    within = torch.maximum(var_l, var_r).sqrt()
+    sep = mean_r - mean_l
+
+    supported = torch.isfinite(best_gap) & (n_conf >= min_samples) & (sep > kappa * within)
+    sep = torch.where(supported, sep, torch.zeros_like(sep))
+
+    m_lo = cw_l / tw
+    dom_is_lo = m_lo >= 0.5
+    z_mean = cwz[-1] / tw
+    z_dom = torch.where(supported, torch.where(dom_is_lo, z_lo, z_hi), z_mean)
+    z_alt = torch.where(supported, torch.where(dom_is_lo, z_hi, z_lo), z_dom)
+    m_dom = torch.where(supported, torch.maximum(m_lo, 1. - m_lo), torch.ones_like(m_lo))
+    return z_dom, z_alt, m_dom, sep
+
+
 def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
     assert len(ptmaps11) == len(confs11) > 0, 'not a single view1 for img={i}'
 
     # canonical pointmap is just a weighted average
+    conf_raw = confs11                       # (E,H,W) raw confidences, for 'bimodal'
     confs11 = confs11.unsqueeze(-1) - 0.999
     canon = (confs11 * ptmaps11).sum(0) / confs11.sum(0)
 
@@ -872,7 +943,7 @@ def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
         stacked_canon = (stacked_confs * rel_depth).sum(dim=0) / stacked_confs.sum(dim=0)
         canon2 = F.pixel_shuffle(stacked_canon.unsqueeze(0), subsample).squeeze()
 
-    elif mode == 'avg-angle':
+    elif mode == 'avg-angle' or mode.startswith('bimodal'):
         xy = ptmaps11[..., 0:2].permute(0, 3, 1, 2)
         stacked_xy = F.pixel_unshuffle(xy, subsample)
         B, _, H, W = stacked_xy.shape
@@ -888,6 +959,25 @@ def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
         canon2 = F.pixel_shuffle((1 + stacked_depth / canon[S, S, 2]).unsqueeze(0), subsample).squeeze()
     else:
         raise ValueError(f'bad {mode=}')
+
+    if mode.startswith('bimodal'):
+        # mode = 'bimodal' or 'bimodal-<tau>': replace the mode-collapsing average
+        # with the dominant depth mode at pixels with a well-separated bimodal split
+        tau = float(mode.split('-', 1)[1]) if '-' in mode else 0.15
+        z_dom, z_alt, m_dom, sep = _split_depth_modes(ptmaps11[..., 2], conf_raw)
+        flagged = sep > tau
+
+        # move the canonical 3D point to the dominant mode along its ray
+        zc = canon[..., 2].clamp(min=1e-8)
+        canon = torch.where(flagged[..., None], canon * (z_dom / zc)[..., None], canon)
+
+        # canon2 override at flagged pixels only, such that the resulting frozen
+        # offset (canon2[p]/canon2[center]) equals z_dom[p]/z_canon[center];
+        # unflagged pixels keep their avg-angle offsets exactly
+        def _blockup(m):
+            return m[S, S].repeat_interleave(subsample, 0).repeat_interleave(subsample, 1)
+        z_corr_c = _blockup(canon[..., 2]).clamp(min=1e-8)
+        canon2 = torch.where(flagged, (z_dom / z_corr_c) * _blockup(canon2), canon2)
 
     confs = (confs11.square().sum(dim=0) / confs11.sum(dim=0)).squeeze()
     return canon, canon2, confs
