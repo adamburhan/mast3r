@@ -100,8 +100,14 @@ def main():
     p.add_argument('--matching_conf_thr', type=float, default=5.0)
     p.add_argument('--kinematic_mode', default='hclust-ward',
                    help="'hclust-ward' (repo default) or 'mst' (paper-era)")
+    p.add_argument('--seed', type=int, default=0,
+                   help='seeds the FPS keyframe draw in retrieval (graph.py uses '
+                        'unseeded np.random.choice) and torch, for reproducible graphs')
     p.add_argument('--device', default='cuda')
     args = p.parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     name = args.scene.name
     out = args.out_dir / name
