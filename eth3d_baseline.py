@@ -23,9 +23,38 @@ from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
 import mast3r.utils.path_to_dust3r  # noqa
 from dust3r.utils.image import load_images
 
-from render_gt_depth import read_colmap_images  # COLMAP images.txt parser
-
 torch.serialization.add_safe_globals([argparse.Namespace])
+
+
+def quat_to_R(qw, qx, qy, qz):
+    q = np.array([qw, qx, qy, qz], float)
+    q /= np.linalg.norm(q)
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def read_colmap_images(fname):
+    # COLMAP images.txt alternates: pose line / 2D-points line (possibly empty)
+    views = []
+    expect_pose = True
+    for line in open(fname):
+        if line.startswith('#'):
+            continue
+        if expect_pose:
+            if not line.strip():
+                continue
+            el = line.split()
+            views.append(dict(R=quat_to_R(*map(float, el[1:5])),   # world->cam
+                              t=np.array(list(map(float, el[5:8]))),
+                              cam_id=int(el[8]), name=Path(el[9]).name))
+            expect_pose = False
+        else:
+            expect_pose = True
+    return sorted(views, key=lambda v: v['name'])
 
 
 def pairwise_pose_metrics(R_w2c_est, C_est, R_w2c_gt, C_gt, taus=(1, 3, 5, 10, 15, 30)):
