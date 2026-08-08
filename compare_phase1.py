@@ -68,6 +68,7 @@ def main():
     imgs = sorted((args.scene / 'images' / 'dslr_images_undistorted').glob('*.JPG'))
     acc = {k: [] for k in ('flag_frac', 'canon_a_f', 'canon_b_f', 'dense_a_f',
                            'dense_b_f', 'dense_a_u', 'dense_b_u', 'dense_a_all', 'dense_b_all')}
+    sw_a, sw_b = [], []   # pooled err at pixels where run_b changed the depth
 
     for img in imgs:
         canon_a = load_canon(args.cache, img, 'avg-angle')
@@ -94,6 +95,11 @@ def main():
         errs = {name: aligned_logerr(z, gt_l, valid)
                 for name, z in (('ca', za), ('cb', zb), ('da', dense_a), ('db', dense_b))}
 
+        sw = (dense_a != dense_b) & valid
+        if sw.any():
+            sw_a.append(errs['da'][sw])
+            sw_b.append(errs['db'][sw])
+
         fl, un = flag & valid, ~flag & valid
         if fl.sum() < 20:
             print(f'{img.name}: flag {flag.mean():.2%} (<20 valid flagged px, skipping stats)')
@@ -118,6 +124,11 @@ def main():
         print(f"  post-BA dense @flagged:  {np.mean(acc['dense_a_f']):.3f} -> {np.mean(acc['dense_b_f']):.3f}")
         print(f"  post-BA dense @unflagged:{np.mean(acc['dense_a_u']):.3f} -> {np.mean(acc['dense_b_u']):.3f}")
         print(f"  post-BA dense @all:      {np.mean(acc['dense_a_all']):.3f} -> {np.mean(acc['dense_b_all']):.3f}")
+    if sw_a:
+        ea, eb = np.concatenate(sw_a), np.concatenate(sw_b)
+        print(f"  SWITCHED px (pooled, n={len(ea)}): median err "
+              f"{np.median(ea):.3f} -> {np.median(eb):.3f}, "
+              f"improved {np.mean(eb < ea):.1%}")
 
 
 if __name__ == '__main__':
