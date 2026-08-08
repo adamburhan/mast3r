@@ -418,8 +418,9 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 # max-mixture: min over the 2x2 depth-hypothesis combinations
                 p1b = torch.cat([pts3d_alt[s.img1][s.slice1] for s in loss3d_slices])
                 p2b = torch.cat([pts3d_alt[s.img2][s.slice2] for s in loss3d_slices])
-                err = torch.stack([pix_loss(a, b) for a in (pts3d_1, p1b)
-                                   for b in (pts3d_2, p2b)]).min(dim=0).values
+                err, win = torch.stack([pix_loss(a, b) for a in (pts3d_1, p1b)
+                                        for b in (pts3d_2, p2b)]).min(dim=0)
+                loss_3d.alt_frac = (win > 0).float().mean().item()  # engagement diagnostic
             loss = confs @ err
             cf_sum = confs.sum()
         else:
@@ -433,6 +434,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         # For each 3D point, we have 2 reproj errors
         proj_matrix = K @ w2cam[:, :3]
         loss = npix = 0
+        n_alt = n_tot = 0
         for img1, pix1_filtered, confs_filtered, cf_sum, cleaned_slices in cleaned_corres2d:
             if init[imgs[img1]].get('freeze', 0) >= 1:
                 continue  # no need
@@ -443,10 +445,15 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 if pts3d_alt is not None:
                     # max-mixture: min over the 2 depth hypotheses of the 3D point
                     alt_in_img1 = torch.cat([pts3d_alt[img2][slice2] for img2, slice2 in cleaned_slices])
-                    err = torch.minimum(err, pix_loss(pix1_filtered, reproj2d(proj_matrix[img1], alt_in_img1)))
+                    err_alt = pix_loss(pix1_filtered, reproj2d(proj_matrix[img1], alt_in_img1))
+                    n_alt += int((err_alt < err).sum())
+                    n_tot += len(err)
+                    err = torch.minimum(err, err_alt)
                 loss += confs_filtered @ err
                 npix += confs_filtered.sum()
 
+        if n_tot:
+            loss_2d.alt_frac = n_alt / n_tot  # engagement diagnostic
         return loss / npix if npix != 0 else 0.
 
     def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0):
@@ -481,7 +488,9 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 loss = float(loss)
                 if loss != loss:
                     break  # NaN loss
-                bar.set_postfix_str(f'{lr=:.4f}, {loss=:.3f}')
+                alt = getattr(loss_func, 'alt_frac', None)
+                bar.set_postfix_str(f'{lr=:.4f}, {loss=:.3f}'
+                                    + (f', alt={alt:.2%}' if alt is not None else ''))
                 bar.update(1)
 
         if niter:
