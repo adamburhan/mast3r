@@ -510,6 +510,39 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
     res_coarse = optimize_loop(loss_3d, lr_base=lr1, niter=niter1, pix_loss=loss1)
 
+    if use_mixture:
+        # discrete re-association (max-mixture commit): under the coarse geometry,
+        # each correspondence pixel votes across all its edges for the depth
+        # hypothesis that better explains its matches; the winner is committed
+        # into the anchor offsets and refinement runs hard-assigned.
+        with torch.no_grad():
+            K, (_, cam2w), depthmaps = make_K_cam_depth(log_focals, pps, trans, quats, log_sizes, core_depth)
+            pts3d = make_pts3d(anchors, K, cam2w, depthmaps, base_focals=base_focals)
+            pts3d_alt = make_pts3d(anchors_alt, K, cam2w, depthmaps, base_focals=base_focals)
+            pref = {i: torch.zeros(len(a[0]), device=a[2].device) for i, a in anchors.items()}
+            for s in loss3d_slices:
+                x1d, x1a = pts3d[s.img1][s.slice1], pts3d_alt[s.img1][s.slice1]
+                x2d, x2a = pts3d[s.img2][s.slice2], pts3d_alt[s.img2][s.slice2]
+                d_dd, d_da = (x1d - x2d).norm(dim=-1), (x1d - x2a).norm(dim=-1)
+                d_ad, d_aa = (x1a - x2d).norm(dim=-1), (x1a - x2a).norm(dim=-1)
+                # sign > 0: dominant explains this edge better (min over other endpoint)
+                pref[s.img1][s.slice1] += s.confs * torch.sign(
+                    torch.minimum(d_ad, d_aa) - torch.minimum(d_dd, d_da))
+                pref[s.img2][s.slice2] += s.confs * torch.sign(
+                    torch.minimum(d_da, d_aa) - torch.minimum(d_dd, d_ad))
+            n_flag = n_switch = 0
+            for i, (pixels, _, offsets, offsets_alt) in anchors.items():
+                key = pixels[:, 0].round().long() * 65536 + pixels[:, 1].round().long()
+                uniq, inv = torch.unique(key, return_inverse=True)
+                vote = torch.zeros(len(uniq), device=pref[i].device).index_add_(0, inv, pref[i])
+                flagged = offsets != offsets_alt
+                pick_alt = (vote < 0)[inv] & flagged
+                offsets[pick_alt] = offsets_alt[pick_alt]
+                n_flag += int(flagged.sum())
+                n_switch += int(pick_alt.sum())
+        use_mixture = False  # hard assignment from here on
+        print(f'>> re-association: {n_switch}/{n_flag} flagged correspondences switched to alt')
+
     res_fine = None
     if niter2:
         # now we can optimize 3d points
