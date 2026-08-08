@@ -368,6 +368,14 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             cf_sum = confs_filtered.sum()
         cleaned_corres2d.append((img1, pix1_filtered, confs_filtered, cf_sum, cleaned_slices))
 
+    # max-mixture depth hypotheses (present only in bimodal canonical mode):
+    # anchors may carry an alternate offset in slot 3; require all images to have it
+    anchors_alt = {i: (a[0], a[1], a[3]) for i, a in anchors.items() if len(a) > 3}
+    use_mixture = bool(anchors_alt) and len(anchors_alt) == len(anchors)
+    if anchors_alt and not use_mixture:
+        print('!! partial depth hypotheses (stale canon cache without .alt?), mixture disabled')
+        anchors_alt = {}
+
     def loss_dust3r(cam2w, pts3d, pix_loss):
         # In the case no correspondence could be established, fallback to DUSt3R GA regression loss formulation (sparsified)
         loss = 0.
@@ -382,7 +390,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             loss += tgt_confs @ pix_loss(pts3d[s.img1], tgt_pts)
         return loss / cf_sum if cf_sum != 0. else 0.
 
-    def loss_3d(K, w2cam, pts3d, pix_loss):
+    def loss_3d(K, w2cam, pts3d, pix_loss, pts3d_alt=None):
         # For each correspondence, we have two 3D points (one for each image of the pair).
         # For each 3D point, we have 2 reproj errors
         if any(v.get('freeze') for v in init.values()):
@@ -404,7 +412,15 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             confs = torch.cat(confs)
             pts3d_1 = torch.cat(pts3d_1)
             pts3d_2 = torch.cat(pts3d_2)
-            loss = confs @ pix_loss(pts3d_1, pts3d_2)
+            if pts3d_alt is None or any(v.get('freeze') for v in init.values()):
+                err = pix_loss(pts3d_1, pts3d_2)
+            else:
+                # max-mixture: min over the 2x2 depth-hypothesis combinations
+                p1b = torch.cat([pts3d_alt[s.img1][s.slice1] for s in loss3d_slices])
+                p2b = torch.cat([pts3d_alt[s.img2][s.slice2] for s in loss3d_slices])
+                err = torch.stack([pix_loss(a, b) for a in (pts3d_1, p1b)
+                                   for b in (pts3d_2, p2b)]).min(dim=0).values
+            loss = confs @ err
             cf_sum = confs.sum()
         else:
             loss = 0.
@@ -412,7 +428,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         return loss / cf_sum
 
-    def loss_2d(K, w2cam, pts3d, pix_loss):
+    def loss_2d(K, w2cam, pts3d, pix_loss, pts3d_alt=None):
         # For each correspondence, we have two 3D points (one for each image of the pair).
         # For each 3D point, we have 2 reproj errors
         proj_matrix = K @ w2cam[:, :3]
@@ -423,7 +439,12 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             pts3d_in_img1 = [pts3d[img2][slice2] for img2, slice2 in cleaned_slices]
             if pts3d_in_img1 != []:
                 pts3d_in_img1 = torch.cat(pts3d_in_img1)
-                loss += confs_filtered @ pix_loss(pix1_filtered, reproj2d(proj_matrix[img1], pts3d_in_img1))
+                err = pix_loss(pix1_filtered, reproj2d(proj_matrix[img1], pts3d_in_img1))
+                if pts3d_alt is not None:
+                    # max-mixture: min over the 2 depth hypotheses of the 3D point
+                    alt_in_img1 = torch.cat([pts3d_alt[img2][slice2] for img2, slice2 in cleaned_slices])
+                    err = torch.minimum(err, pix_loss(pix1_filtered, reproj2d(proj_matrix[img1], alt_in_img1)))
+                loss += confs_filtered @ err
                 npix += confs_filtered.sum()
 
         return loss / npix if npix != 0 else 0.
@@ -438,6 +459,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             for iter in range(niter or 1):
                 K, (w2cam, cam2w), depthmaps = make_K_cam_depth(log_focals, pps, trans, quats, log_sizes, core_depth)
                 pts3d = make_pts3d(anchors, K, cam2w, depthmaps, base_focals=base_focals)
+                pts3d_alt = make_pts3d(anchors_alt, K, cam2w, depthmaps, base_focals=base_focals) \
+                    if use_mixture else None
                 if niter == 0:
                     break
 
@@ -446,7 +469,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 adjust_learning_rate_by_lr(optimizer, lr)
                 pix_loss = ploss(1 - alpha)
                 optimizer.zero_grad()
-                loss = loss_func(K, w2cam, pts3d, pix_loss) + loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
+                loss = loss_func(K, w2cam, pts3d, pix_loss, pts3d_alt) \
+                    + loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
                 loss.backward()
                 optimizer.step()
 
@@ -516,7 +540,7 @@ def make_pts3d(anchors, K, cam2w, depthmaps, base_focals=None, ret_depth=False):
     all_pts3d = []
     depth_out = []
 
-    for img, (pixels, idxs, offsets) in anchors.items():
+    for img, (pixels, idxs, offsets, *_) in anchors.items():
         # from depthmaps to 3d points
         if base_focals is None:
             pass
@@ -680,8 +704,11 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
         if cache_path:
             cache = os.path.join(cache_path, 'canon_views', hash_md5(img) + f'_{subsample=}_{kw=}.pth')
             canonical_paths.append(cache)
+        canon2_alt = None
         try:
             (canon, canon2, cconf), focal = torch.load(cache, map_location=device)
+            if os.path.isfile(cache + '.alt'):
+                canon2_alt = torch.load(cache + '.alt', map_location=device)
         except IOError:
             # cache does not exist yet, we create it!
             canon = focal = None
@@ -731,7 +758,9 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
                 n += 1
 
         if canon is None:
-            canon, canon2, cconf = canonical_view(ptmaps11, confs11, subsample, **kw)
+            out = canonical_view(ptmaps11, confs11, subsample, **kw)
+            canon, canon2, cconf = out[:3]
+            canon2_alt = out[3] if len(out) > 3 else None
             del ptmaps11
             del confs11
 
@@ -742,12 +771,16 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
             focal = estimate_focal_knowing_depth(canon[None], pp, focal_mode='weiszfeld', min_focal=0.5, max_focal=3.5)
             if cache:
                 torch.save(to_cpu(((canon, canon2, cconf), focal)), mkdir_for(cache))
+                if canon2_alt is not None:
+                    torch.save(to_cpu(canon2_alt), cache + '.alt')
 
         # extract depth offsets with correspondences
         core_depth = canon[subsample // 2::subsample, subsample // 2::subsample, 2]
         idxs, offsets = anchor_depth_offsets(canon2, pixels, subsample=subsample)
+        offsets_alt = anchor_depth_offsets(canon2_alt, pixels, subsample=subsample)[1] \
+            if canon2_alt is not None else None
 
-        canonical_views[img] = (pp, (H, W), focal.view(1), core_depth, pixels, idxs, offsets)
+        canonical_views[img] = (pp, (H, W), focal.view(1), core_depth, pixels, idxs, offsets, offsets_alt)
 
     return tmp_pairs, pairwise_scores, canonical_views, canonical_paths, preds_21
 
@@ -777,7 +810,7 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
 
     for idx1, img1 in enumerate(imgs):
         # load stuff
-        pp, shape, focal, anchors, pixels_confs, idxs, offsets = canonical_views[img1]
+        pp, shape, focal, anchors, pixels_confs, idxs, offsets, offsets_alt = canonical_views[img1]
 
         principal_points.append(pp)
         shapes.append(shape)
@@ -787,6 +820,7 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
         img_uv1 = []
         img_idxs = []
         img_offs = []
+        img_offs_alt = []
         cur_n = [0]
 
         for img2, (pixels, match_confs) in pixels_confs.items():
@@ -796,10 +830,14 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
             img_uv1.append(torch.cat((pixels, torch.ones_like(pixels[:, :1])), dim=-1))
             img_idxs.append(idxs[img2])
             img_offs.append(offsets[img2])
+            if offsets_alt is not None:
+                img_offs_alt.append(offsets_alt[img2])
             cur_n.append(cur_n[-1] + len(pixels))
             # store the position of 3d points
             tmp_pixels[img1, img2] = pixels.to(dtype), match_confs.to(dtype), slice(*cur_n[-2:])
         img_anchors[idx1] = (torch.cat(img_uv1), torch.cat(img_idxs), torch.cat(img_offs))
+        if offsets_alt is not None:
+            img_anchors[idx1] += (torch.cat(img_offs_alt),)
 
     all_confs = []
     imgs_slices = []
@@ -977,9 +1015,13 @@ def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
         def _blockup(m):
             return m[S, S].repeat_interleave(subsample, 0).repeat_interleave(subsample, 1)
         z_corr_c = _blockup(canon[..., 2]).clamp(min=1e-8)
-        canon2 = torch.where(flagged, (z_dom / z_corr_c) * _blockup(canon2), canon2)
+        c2c = _blockup(canon2)
+        canon2_alt = torch.where(flagged, (z_alt / z_corr_c) * c2c, canon2)
+        canon2 = torch.where(flagged, (z_dom / z_corr_c) * c2c, canon2)
 
     confs = (confs11.square().sum(dim=0) / confs11.sum(dim=0)).squeeze()
+    if mode.startswith('bimodal'):
+        return canon, canon2, confs, canon2_alt
     return canon, canon2, confs
 
 
