@@ -77,6 +77,8 @@ def main():
     p.add_argument('--gt_dir', type=Path, default=None)
     p.add_argument('--tau', type=float, default=0.15)
     p.add_argument('--rel_tol', type=float, default=0.08)
+    p.add_argument('--margin', type=int, default=2,
+                   help='override dominant only if alt wins by > margin votes')
     args = p.parse_args()
     gt_dir = args.gt_dir or args.scene / 'gt_depth_render'
 
@@ -85,6 +87,17 @@ def main():
     depths = {n: np.load(args.run / f'depth_{Path(n).stem}.npy') for n in names}
     w2c = [np.linalg.inv(c) for c in cam2w]
     imgdir = args.scene / 'images' / 'dslr_images_undistorted'
+
+    # referee depths: mask out each referee's own flagged pixels so correlated
+    # wrong-mode regions cannot vote (their depth there is unreliable)
+    ref_depths = {}
+    for n in names:
+        c2, c2_alt = load_canon2_pair(args.cache, imgdir / n, args.tau)
+        d = depths[n].copy()
+        if c2 is not None:
+            d[np.abs(c2_alt / np.clip(c2, EPS, None) - 1.) > 1e-4] = np.nan
+        d[d <= 0] = np.nan
+        ref_depths[n] = d
 
     acc = {k: [] for k in ('acc', 'err_dom', 'err_read', 'err_orc', 'nflag')}
     for a, name in enumerate(names):
@@ -104,7 +117,7 @@ def main():
         m = valid & ~flag
         d_al = np.median(np.log(np.clip(gt[m], EPS, None)) - np.log(np.clip(dense[m], EPS, None)))
 
-        sel = flag & valid
+        sel = flag & valid & (dense > 0)
         if sel.sum() < 20:
             continue
         vv, uu = np.nonzero(sel)
@@ -112,17 +125,17 @@ def main():
         z_dom = dense[sel]
         z_alt = z_dom * ratio[sel]
 
-        others = [(intrinsics[j], w2c[j], depths[names[j]])
+        others = [(intrinsics[j], w2c[j], ref_depths[names[j]])
                   for j in range(len(names)) if j != a]
         v_dom = consistency_votes(uv, z_dom, intrinsics[a], cam2w[a], others, args.rel_tol)
         v_alt = consistency_votes(uv, z_alt, intrinsics[a], cam2w[a], others, args.rel_tol)
-        pick_alt = v_alt > v_dom                      # ties -> keep dominant
+        pick_alt = v_alt > v_dom + args.margin        # near-ties -> keep dominant
 
         gt_l = np.log(np.clip(gt[sel], EPS, None))
         e_dom = np.abs(np.log(z_dom) + d_al - gt_l)
         e_alt = np.abs(np.log(z_alt) + d_al - gt_l)
         gt_prefers_alt = e_alt < e_dom
-        decided = (v_alt != v_dom)
+        decided = np.abs(v_alt - v_dom) > args.margin
         acc_i = np.mean(pick_alt[decided] == gt_prefers_alt[decided]) if decided.any() else np.nan
         e_read = np.where(pick_alt, e_alt, e_dom)
 
@@ -137,9 +150,9 @@ def main():
     if acc['acc']:
         print(f"\n===== AGGREGATE over {len(acc['acc'])} images =====")
         print(f"  readout accuracy vs GT:   {np.nanmean(acc['acc']):.1%}")
-        print(f"  dense @flagged: dominant  {np.mean(acc['err_dom']):.3f}")
-        print(f"  dense @flagged: readout   {np.mean(acc['err_read']):.3f}")
-        print(f"  dense @flagged: GT-oracle {np.mean(acc['err_orc']):.3f}")
+        print(f"  dense @flagged: dominant  {np.nanmean(acc['err_dom']):.3f}")
+        print(f"  dense @flagged: readout   {np.nanmean(acc['err_read']):.3f}")
+        print(f"  dense @flagged: GT-oracle {np.nanmean(acc['err_orc']):.3f}")
 
 
 if __name__ == '__main__':
