@@ -533,10 +533,10 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             n_flag = n_switch = 0
             for i, (pixels, _, offsets, offsets_alt) in anchors.items():
                 key = pixels[:, 0].round().long() * 65536 + pixels[:, 1].round().long()
-                uniq, inv = torch.unique(key, return_inverse=True)
-                vote = torch.zeros(len(uniq), device=pref[i].device).index_add_(0, inv, pref[i])
+                uniq, inv_idx = torch.unique(key, return_inverse=True)
+                vote = torch.zeros(len(uniq), device=pref[i].device).index_add_(0, inv_idx, pref[i])
                 flagged = offsets != offsets_alt
-                pick_alt = (vote < 0)[inv] & flagged
+                pick_alt = (vote < 0)[inv_idx] & flagged
                 offsets[pick_alt] = offsets_alt[pick_alt]
                 n_flag += int(flagged.sum())
                 n_switch += int(pick_alt.sum())
